@@ -174,9 +174,14 @@ struct nvme_bdev {
 	struct nvme_error_stat			*err_stat;
 };
 
+#define BSWCH_NUM_QPS 2
+#define BSWCH_LC_QP_IDX 0
+#define BSWCH_BE_QP_IDX 1
+
 struct nvme_qpair {
 	struct nvme_ctrlr		*ctrlr;
 	struct spdk_nvme_qpair		*qpair;
+	struct spdk_nvme_qpair		*qpairs[BSWCH_NUM_QPS];
 	struct nvme_poll_group		*group;
 	struct nvme_ctrlr_channel	*ctrlr_ch;
 

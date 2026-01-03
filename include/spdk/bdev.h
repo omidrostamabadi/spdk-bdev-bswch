@@ -272,6 +272,10 @@ union spdk_bdev_nvme_cdw13 {
 };
 SPDK_STATIC_ASSERT(sizeof(union spdk_bdev_nvme_cdw13) == 4, "Incorrect size");
 
+/* I/O flags */
+#define SPDK_BDEV_IO_FLAG_LC 0x1
+#define SPDK_BDEV_IO_FLAG_BE 0x2
+
 /**
  * Structure with optional IO request parameters
  */
@@ -293,6 +297,10 @@ struct spdk_bdev_ext_io_opts {
 	 */
 	struct spdk_accel_sequence *accel_sequence;
 	/**
+	 * One or multiple flags from SPDK_BDEV_IO_FLAG_*, ORed together
+	 */
+	uint64_t io_flags;
+	/**
 	 * Specify which DIF check flags to exclude on a per-IO basis. The default value is
 	 * all zeroes, which includes all of the flags set for this bdev. If any of the flags
 	 * is set, that flag will be excluded from any DIF operations for this IO.
@@ -303,7 +311,7 @@ struct spdk_bdev_ext_io_opts {
 	/** defined by \ref spdk_bdev_nvme_cdw13 */
 	union spdk_bdev_nvme_cdw13 nvme_cdw13;
 } __attribute__((packed));
-SPDK_STATIC_ASSERT(sizeof(struct spdk_bdev_ext_io_opts) == 52, "Incorrect size");
+SPDK_STATIC_ASSERT(sizeof(struct spdk_bdev_ext_io_opts) == 60, "Incorrect size");
 
 /**
  * Get the options for the bdev module.

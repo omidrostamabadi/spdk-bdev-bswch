@@ -1757,8 +1757,14 @@ bdev_nvme_disconnected_qpair_cb(struct spdk_nvme_qpair *qpair, void *poll_group_
 		return;
 	}
 
-	if (nvme_qpair->qpair != NULL) {
-		spdk_nvme_ctrlr_free_io_qpair(nvme_qpair->qpair);
+	if (nvme_qpair->qpairs[BSWCH_LC_QP_IDX] != NULL) {
+		spdk_nvme_ctrlr_free_io_qpair(nvme_qpair->qpairs[BSWCH_LC_QP_IDX]);
+		nvme_qpair->qpairs[BSWCH_LC_QP_IDX] = NULL;
+	}
+
+	if (nvme_qpair->qpairs[BSWCH_BE_QP_IDX] != NULL) {
+		spdk_nvme_ctrlr_free_io_qpair(nvme_qpair->qpairs[BSWCH_BE_QP_IDX]);
+		nvme_qpair->qpairs[BSWCH_BE_QP_IDX] = NULL;
 		nvme_qpair->qpair = NULL;
 	}
 
@@ -1947,6 +1953,7 @@ bdev_nvme_create_qpair(struct nvme_qpair *nvme_qpair)
 	struct nvme_ctrlr *nvme_ctrlr;
 	struct spdk_nvme_io_qpair_opts opts;
 	struct spdk_nvme_qpair *qpair;
+	struct spdk_nvme_qpair *qpairs[BSWCH_NUM_QPS];
 	int rc;
 
 	nvme_ctrlr = nvme_qpair->ctrlr;
@@ -1964,28 +1971,34 @@ bdev_nvme_create_qpair(struct nvme_qpair *nvme_qpair)
 	opts.io_queue_requests = spdk_max(g_opts.io_queue_requests, opts.io_queue_requests);
 	g_opts.io_queue_requests = opts.io_queue_requests;
 
-	qpair = spdk_nvme_ctrlr_alloc_io_qpair(nvme_ctrlr->ctrlr, &opts, sizeof(opts));
-	if (qpair == NULL) {
+	qpairs[BSWCH_LC_QP_IDX] = spdk_nvme_ctrlr_alloc_io_qpair(nvme_ctrlr->ctrlr, &opts, sizeof(opts));
+	qpairs[BSWCH_BE_QP_IDX] = spdk_nvme_ctrlr_alloc_io_qpair(nvme_ctrlr->ctrlr, &opts, sizeof(opts));
+	if (qpairs[BSWCH_LC_QP_IDX] == NULL || qpairs[BSWCH_BE_QP_IDX] == NULL) {
 		return -1;
 	}
+	qpair = qpairs[BSWCH_LC_QP_IDX];
 
 	SPDK_DTRACE_PROBE3(bdev_nvme_create_qpair, nvme_ctrlr->nbdev_ctrlr->name,
 			   spdk_nvme_qpair_get_id(qpair), spdk_thread_get_id(nvme_ctrlr->thread));
 
 	assert(nvme_qpair->group != NULL);
 
-	rc = spdk_nvme_poll_group_add(nvme_qpair->group->group, qpair);
+	rc = spdk_nvme_poll_group_add(nvme_qpair->group->group, qpairs[BSWCH_LC_QP_IDX]);
+	rc |= spdk_nvme_poll_group_add(nvme_qpair->group->group, qpairs[BSWCH_BE_QP_IDX]);
 	if (rc != 0) {
 		NVME_CTRLR_ERRLOG(nvme_ctrlr, "Unable to begin polling on NVMe Channel.\n");
 		goto err;
 	}
 
-	rc = spdk_nvme_ctrlr_connect_io_qpair(nvme_ctrlr->ctrlr, qpair);
+	rc = spdk_nvme_ctrlr_connect_io_qpair(nvme_ctrlr->ctrlr, qpairs[BSWCH_LC_QP_IDX]);
+	rc |= spdk_nvme_ctrlr_connect_io_qpair(nvme_ctrlr->ctrlr, qpairs[BSWCH_BE_QP_IDX]);
 	if (rc != 0) {
 		NVME_CTRLR_ERRLOG(nvme_ctrlr, "Unable to connect I/O qpair.\n");
 		goto err;
 	}
 
+	nvme_qpair->qpairs[BSWCH_LC_QP_IDX] = qpairs[BSWCH_LC_QP_IDX];
+	nvme_qpair->qpairs[BSWCH_BE_QP_IDX] = qpairs[BSWCH_BE_QP_IDX];
 	nvme_qpair->qpair = qpair;
 
 	if (!g_opts.disable_auto_failback) {
@@ -1998,7 +2011,8 @@ bdev_nvme_create_qpair(struct nvme_qpair *nvme_qpair)
 	return 0;
 
 err:
-	spdk_nvme_ctrlr_free_io_qpair(qpair);
+	spdk_nvme_ctrlr_free_io_qpair(qpairs[BSWCH_LC_QP_IDX]);
+	spdk_nvme_ctrlr_free_io_qpair(qpairs[BSWCH_BE_QP_IDX]);
 
 	return rc;
 }
@@ -2369,9 +2383,11 @@ bdev_nvme_reset_destroy_qpair(struct nvme_ctrlr_channel_iter *i,
 				   qpair, spdk_nvme_qpair_get_id(qpair));
 
 		if (nvme_qpair->ctrlr->dont_retry) {
-			spdk_nvme_qpair_set_abort_dnr(qpair, true);
+			spdk_nvme_qpair_set_abort_dnr(nvme_qpair->qpairs[BSWCH_LC_QP_IDX], true);
+			spdk_nvme_qpair_set_abort_dnr(nvme_qpair->qpairs[BSWCH_BE_QP_IDX], true);
 		}
-		spdk_nvme_ctrlr_disconnect_io_qpair(qpair);
+		spdk_nvme_ctrlr_disconnect_io_qpair(nvme_qpair->qpairs[BSWCH_LC_QP_IDX]);
+		spdk_nvme_ctrlr_disconnect_io_qpair(nvme_qpair->qpairs[BSWCH_BE_QP_IDX]);
 
 		/* The current full reset sequence will move to the next
 		 * ctrlr_channel after the qpair is actually disconnected.
@@ -8328,14 +8344,30 @@ bdev_nvme_no_pi_readv(struct nvme_bdev_io *bio, struct iovec *iov, int iovcnt,
 	return rc;
 }
 
+static inline struct spdk_nvme_qpair *
+bdev_nvme_get_qpair(struct nvme_qpair *qpair, uint64_t io_flags)
+{
+	// struct spdk_bdev_io *bdev_io = spdk_bdev_io_from_ctx(bio);
+	if (io_flags & SPDK_BDEV_IO_FLAG_LC) {
+		// SPDK_NOTICELOG("picked %p with flags %ld\n", bio->io_path->qpair->qpairs[BSWCH_LC_QP_IDX], bdev_io->io_flags);
+		return qpair->qpairs[BSWCH_LC_QP_IDX];
+	}
+	else {
+		// SPDK_NOTICELOG("picked %p with flags %ld\n", bio->io_path->qpair->qpairs[BSWCH_BE_QP_IDX], bdev_io->io_flags);
+		return qpair->qpairs[BSWCH_BE_QP_IDX];
+	}
+}
+
 static int
 bdev_nvme_readv(struct nvme_bdev_io *bio, struct iovec *iov, int iovcnt,
 		void *md, uint64_t lba_count, uint64_t lba, uint32_t flags,
 		struct spdk_memory_domain *domain, void *domain_ctx,
 		struct spdk_accel_sequence *seq)
 {
+	struct spdk_bdev_io *bdev_io = spdk_bdev_io_from_ctx(bio);
 	struct spdk_nvme_ns *ns = bio->io_path->nvme_ns->ns;
-	struct spdk_nvme_qpair *qpair = bio->io_path->qpair->qpair;
+	// struct spdk_nvme_qpair *qpair = bio->io_path->qpair->qpair;
+	struct spdk_nvme_qpair *qpair = bdev_nvme_get_qpair(bio->io_path->qpair, bdev_io->io_flags);
 	int rc;
 
 	SPDK_DEBUGLOG(bdev_nvme, "read %" PRIu64 " blocks with offset %#" PRIx64 "\n",

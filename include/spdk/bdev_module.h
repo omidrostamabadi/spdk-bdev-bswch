@@ -1119,7 +1119,10 @@ struct spdk_bdev_io {
 		struct spdk_bdev_io_zone_mgmt_params zone_mgmt;
 	} u;
 
-	uint8_t reserved3[40];
+	/** Store I/O flags given by user through spdk_bdev_ext_io_opts */
+	uint64_t io_flags;
+
+	uint8_t reserved3[32];
 
 	/**
 	 *  Fields that are used internally by the bdev subsystem.  Bdev modules

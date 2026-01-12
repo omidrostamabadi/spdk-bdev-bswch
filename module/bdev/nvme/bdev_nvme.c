@@ -1070,6 +1070,8 @@ bswch_bdev_nvme_writev_done(void *ref, const struct spdk_nvme_cpl *cpl)
 {
 	struct nvme_bdev_io *bio = ref;
 	bio->fwd_ctx.cpl = cpl;
+
+	__atomic_fetch_sub(&bio->fwd_ctx.dst_ch->rif_bytes[BSWCH_BE_QP_IDX], bdev_nvme_get_req_len(spdk_bdev_io_from_ctx(bio)), __ATOMIC_RELAXED); 
 		
 	spdk_thread_exec_msg(bio->fwd_ctx.thread, _bswch_complete_io_write, bio);
 }
@@ -1580,46 +1582,14 @@ bswch_ctrlr_channel_join(struct nvme_ctrlr *nvme_ctrlr)
 	SPDK_ERRLOG("Cannot get io path or nvme ctrlr from nbdev channel\n");
 }
 
-/* 
-* Return
-*/
-static void
-_spdk_bdev_nvme_tmgr_request_return(void *arg) {
-	struct nvme_bdev_io *bio = arg; 
-	struct spdk_bdev_io *bdev_io = spdk_bdev_io_from_ctx(bio);
-	bio->forwarded = false;
-	if (bdev_io->type == SPDK_BDEV_IO_TYPE_READ)
-		bswch_bdev_nvme_readv(bio, bio->io_path->qpair->qpair, 
-						bdev_io->u.bdev.iovs,
-						bdev_io->u.bdev.iovcnt,
-						bdev_io->u.bdev.md_buf,
-						bdev_io->u.bdev.num_blocks,
-						bdev_io->u.bdev.offset_blocks,
-						bdev_io->u.bdev.dif_check_flags,
-						bdev_io->u.bdev.memory_domain,
-						bdev_io->u.bdev.memory_domain_ctx,
-						bdev_io->u.bdev.accel_sequence);
-	else if (bdev_io->type == SPDK_BDEV_IO_TYPE_WRITE)
-		bswch_bdev_nvme_writev(bio, bio->io_path->qpair->qpair,
-					bdev_io->u.bdev.iovs,
-					bdev_io->u.bdev.iovcnt,
-					bdev_io->u.bdev.md_buf,
-					bdev_io->u.bdev.num_blocks,
-					bdev_io->u.bdev.offset_blocks,
-					bdev_io->u.bdev.dif_check_flags,
-					bdev_io->u.bdev.memory_domain,
-					bdev_io->u.bdev.memory_domain_ctx,
-					bdev_io->u.bdev.accel_sequence,
-					bdev_io->u.bdev.nvme_cdw12,
-					bdev_io->u.bdev.nvme_cdw13);
-	else
-		assert(false);
-}
 
 void 
 bswch_return_request(struct nvme_bdev_io *bio) {
 	bio->forwarded = false;
-	spdk_thread_send_msg(bio->fwd_ctx.thread, _spdk_bdev_nvme_tmgr_request_return, bio);
+	bio->fwd_ctx.dst_ch = bio->io_path->qpair->ctrlr_ch;
+
+	// the fwd function calls the direct submission function
+	spdk_thread_send_msg(bio->fwd_ctx.thread, _bswch_fwd_io_read, bio);
 }
 
 
@@ -9126,7 +9096,7 @@ static inline struct bdev_thread_path *
 bswch_pick_po2(struct bdev_thread_path_list	*pl, uint64_t self_rif) {
 	if (!pl)
 		return NULL;
-		
+
 	int i = rand() % pl->len;
 	int j = rand() % pl->len;
 
@@ -9167,10 +9137,6 @@ bdev_nvme_readv(struct nvme_bdev_io *bio, struct iovec *iov, int iovcnt,
 		struct spdk_memory_domain *domain, void *domain_ctx,
 		struct spdk_accel_sequence *seq)
 {
-	// struct spdk_bdev_io *bdev_io = spdk_bdev_io_from_ctx(bio);
-	// struct spdk_nvme_ns *ns = bio->io_path->nvme_ns->ns;
-	// struct spdk_nvme_qpair *qpair = bio->io_path->qpair->qpair;
-	// struct spdk_nvme_qpair *qpair = bdev_nvme_get_qpair(bio->io_path->qpair, bdev_io->io_flags);
 	struct nvme_ctrlr_channel *ch = bio->io_path->qpair->ctrlr_ch;
 
 	struct bdev_thread_path *tp = bdev_nvme_get_thread_path(bio);
@@ -9185,50 +9151,6 @@ bdev_nvme_readv(struct nvme_bdev_io *bio, struct iovec *iov, int iovcnt,
 	bio->fwd_ctx.dst_ch = ch;
 	bdev_nvme_submit_request_direct(spdk_bdev_io_from_ctx(bio));
 	return 0;
-
-	// int rc;
-
-	// SPDK_DEBUGLOG(bdev_nvme, "read %" PRIu64 " blocks with offset %#" PRIx64 "\n",
-	// 	      lba_count, lba);
-
-	// bio->iovs = iov;
-	// bio->iovcnt = iovcnt;
-	// bio->iovpos = 0;
-	// bio->iov_offset = 0;
-
-	// if (domain != NULL || seq != NULL) {
-	// 	bio->ext_opts.size = SPDK_SIZEOF(&bio->ext_opts, accel_sequence);
-	// 	bio->ext_opts.memory_domain = domain;
-	// 	bio->ext_opts.memory_domain_ctx = domain_ctx;
-	// 	bio->ext_opts.io_flags = flags;
-	// 	bio->ext_opts.metadata = md;
-	// 	bio->ext_opts.accel_sequence = seq;
-
-	// 	if (iovcnt == 1) {
-	// 		rc = spdk_nvme_ns_cmd_read_ext(ns, qpair, iov[0].iov_base, lba, lba_count, bdev_nvme_readv_done,
-	// 					       bio, &bio->ext_opts);
-	// 	} else {
-	// 		rc = spdk_nvme_ns_cmd_readv_ext(ns, qpair, lba, lba_count,
-	// 						bdev_nvme_readv_done, bio,
-	// 						bdev_nvme_queued_reset_sgl,
-	// 						bdev_nvme_queued_next_sge,
-	// 						&bio->ext_opts);
-	// 	}
-	// } else if (iovcnt == 1) {
-	// 	rc = spdk_nvme_ns_cmd_read_with_md(ns, qpair, iov[0].iov_base,
-	// 					   md, lba, lba_count, bdev_nvme_readv_done,
-	// 					   bio, flags, 0, 0);
-	// } else {
-	// 	rc = spdk_nvme_ns_cmd_readv_with_md(ns, qpair, lba, lba_count,
-	// 					    bdev_nvme_readv_done, bio, flags,
-	// 					    bdev_nvme_queued_reset_sgl,
-	// 					    bdev_nvme_queued_next_sge, md, 0, 0);
-	// }
-
-	// if (spdk_unlikely(rc != 0 && rc != -ENOMEM)) {
-	// 	SPDK_ERRLOG("readv failed: rc = %d\n", rc);
-	// }
-	// return rc;
 }
 
 static int
@@ -9238,52 +9160,20 @@ bdev_nvme_writev(struct nvme_bdev_io *bio, struct iovec *iov, int iovcnt,
 		 struct spdk_accel_sequence *seq,
 		 union spdk_bdev_nvme_cdw12 cdw12, union spdk_bdev_nvme_cdw13 cdw13)
 {
-	struct spdk_nvme_ns *ns = bio->io_path->nvme_ns->ns;
-	struct spdk_nvme_qpair *qpair = bio->io_path->qpair->qpair;
-	int rc;
+	struct nvme_ctrlr_channel *ch = bio->io_path->qpair->ctrlr_ch;
 
-	SPDK_DEBUGLOG(bdev_nvme, "write %" PRIu64 " blocks with offset %#" PRIx64 "\n",
-		      lba_count, lba);
+	struct bdev_thread_path *tp = bdev_nvme_get_thread_path(bio);
+	bio->fwd_ctx.thread = spdk_get_thread();
 
-	bio->iovs = iov;
-	bio->iovcnt = iovcnt;
-	bio->iovpos = 0;
-	bio->iov_offset = 0;
-
-	if (domain != NULL || seq != NULL) {
-		bio->ext_opts.size = SPDK_SIZEOF(&bio->ext_opts, accel_sequence);
-		bio->ext_opts.memory_domain = domain;
-		bio->ext_opts.memory_domain_ctx = domain_ctx;
-		bio->ext_opts.io_flags = flags | SPDK_NVME_IO_FLAGS_DIRECTIVE(cdw12.write.dtype);
-		bio->ext_opts.cdw13 = cdw13.raw;
-		bio->ext_opts.metadata = md;
-		bio->ext_opts.accel_sequence = seq;
-
-		if (iovcnt == 1) {
-			rc = spdk_nvme_ns_cmd_write_ext(ns, qpair, iov[0].iov_base, lba, lba_count, bdev_nvme_writev_done,
-							bio, &bio->ext_opts);
-		} else {
-			rc = spdk_nvme_ns_cmd_writev_ext(ns, qpair, lba, lba_count,
-							 bdev_nvme_writev_done, bio,
-							 bdev_nvme_queued_reset_sgl,
-							 bdev_nvme_queued_next_sge,
-							 &bio->ext_opts);
-		}
-	} else if (iovcnt == 1) {
-		rc = spdk_nvme_ns_cmd_write_with_md(ns, qpair, iov[0].iov_base,
-						    md, lba, lba_count, bdev_nvme_writev_done,
-						    bio, flags, 0, 0);
-	} else {
-		rc = spdk_nvme_ns_cmd_writev_with_md(ns, qpair, lba, lba_count,
-						     bdev_nvme_writev_done, bio, flags,
-						     bdev_nvme_queued_reset_sgl,
-						     bdev_nvme_queued_next_sge, md, 0, 0);
+	if (tp) {
+		bio->fwd_ctx.dst_ch = tp->ctrlr_ch;
+		spdk_thread_send_msg(tp->thread, _bswch_fwd_io_read, bio);
+		return 0;
 	}
 
-	if (spdk_unlikely(rc != 0 && rc != -ENOMEM)) {
-		SPDK_ERRLOG("writev failed: rc = %d\n", rc);
-	}
-	return rc;
+	bio->fwd_ctx.dst_ch = ch;
+	bdev_nvme_submit_request_direct(spdk_bdev_io_from_ctx(bio));
+	return 0;
 }
 
 static int

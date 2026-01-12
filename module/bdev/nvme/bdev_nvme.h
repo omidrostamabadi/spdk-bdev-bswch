@@ -16,6 +16,12 @@
 #include "spdk/module/bdev/nvme.h"
 #include "spdk/jsonrpc.h"
 
+/* Bright colors that stay readable on white backgrounds */
+#define SPDK_ERRLOG_RED(fmt, ...)   SPDK_ERRLOG("\033[1;31m" fmt "\033[0m", ##__VA_ARGS__)
+#define SPDK_ERRLOG_GRN(fmt, ...)   SPDK_ERRLOG("\033[1;32m" fmt "\033[0m", ##__VA_ARGS__)
+#define SPDK_ERRLOG_CYN(fmt, ...)   SPDK_ERRLOG("\033[1;36m" fmt "\033[0m", ##__VA_ARGS__)
+#define SPDK_ERRLOG_MAG(fmt, ...)   SPDK_ERRLOG("\033[1;35m" fmt "\033[0m", ##__VA_ARGS__)
+
 TAILQ_HEAD(nvme_bdev_ctrlrs, nvme_bdev_ctrlr);
 extern struct nvme_bdev_ctrlrs g_nvme_bdev_ctrlrs;
 extern pthread_mutex_t g_bdev_nvme_mutex;
@@ -85,6 +91,20 @@ struct spdk_nvme_path_id {
 typedef void (*bdev_nvme_ctrlr_op_cb)(void *cb_arg, int rc);
 typedef void (*nvme_ctrlr_disconnected_cb)(struct nvme_ctrlr *nvme_ctrlr);
 
+#define GSCHED_TEST_FLAG(var, flag) ((var) & (flag))
+#define GSCHED_SET_FLAG(var, flag) ((var) |= (flag))
+#define GSCHED_CLEAR_FLAG(var, flag) ((var) &= ~(flag))
+
+#define GSCHED_MSG_IN_FLIGHT 0x1
+
+struct global_bswch_scheduler {
+	struct nvme_ctrlr *ctrlr;
+	uint64_t flags;
+	TAILQ_HEAD(, bdev_thread_info) global_threads;
+	TAILQ_HEAD(, bdev_thread_path) global_paths;
+	TAILQ_HEAD(, bswch_sync_msg) waiting_msgs;
+};
+
 struct nvme_ctrlr {
 	/**
 	 * points to pinned, physically contiguous memory region;
@@ -115,6 +135,8 @@ struct nvme_ctrlr {
 	struct spdk_poller			*adminq_timer_poller;
 	struct spdk_thread			*thread;
 	struct spdk_interrupt			*intr;
+
+	struct global_bswch_scheduler 	*gsched;
 
 	bdev_nvme_ctrlr_op_cb			ctrlr_op_cb_fn;
 	void					*ctrlr_op_cb_arg;
@@ -177,6 +199,7 @@ struct nvme_bdev {
 #define BSWCH_NUM_QPS 2
 #define BSWCH_LC_QP_IDX 0
 #define BSWCH_BE_QP_IDX 1
+#define BSWCH_BE_RIF_TH (64 * 1024)
 
 struct nvme_qpair {
 	struct nvme_ctrlr		*ctrlr;
@@ -194,8 +217,15 @@ struct nvme_qpair {
 struct nvme_ctrlr_channel {
 	struct nvme_qpair		*qpair;
 
+	struct bdev_thread_path *active_thread_path;
+	uint64_t rif_bytes[BSWCH_NUM_QPS];
+	/* Doing this as a tailq is better, but we may need to index directly into any 
+	 element in the list without walking the linked list, therefore we use a dynamic array here. */
+	struct bdev_thread_path_list *path_list;
+	uint32_t num_bdev_ch;
 	struct nvme_ctrlr_channel_iter	*reset_iter;
 	struct spdk_poller		*connect_poller;
+	struct nvme_ctrlr_channel *extra_ref;
 };
 
 struct nvme_io_path {
@@ -362,5 +392,9 @@ typedef void (*bdev_nvme_set_preferred_path_cb)(void *cb_arg, int rc);
  */
 void bdev_nvme_set_preferred_path(const char *name, uint16_t cntlid,
 				  bdev_nvme_set_preferred_path_cb cb_fn, void *cb_arg);
+
+
+
+void bswch_return_request(struct nvme_bdev_io *bio);
 
 #endif /* SPDK_BDEV_NVME_H */
